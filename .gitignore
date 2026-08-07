@@ -1,0 +1,14 @@
+# 密钥
+.env
+
+# 运行时产物 (状态、日志、交易记录、锁文件等)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# macOS 资源叉文件
+._*
