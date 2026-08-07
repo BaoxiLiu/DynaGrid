@@ -84,7 +84,7 @@ WEBSOCKET_REST_WAKE_DEBOUNCE_SECONDS = 2
 # ============================================================
 # COIN_PRESET 可选: "top10" | "top15" | "top20" | "custom"
 #   切换到 "custom" 后，下方 COIN_POOLS["custom"] 里的列表生效
-COIN_PRESET = "top10"
+COIN_PRESET = "custom"
 
 COIN_POOLS = {
     "top10": [
@@ -103,7 +103,9 @@ COIN_POOLS = {
         "SUI", "APT", "ARB", "OP", "ATOM",
     ],
     "custom": [
-        "BTC", "ETH",
+        "BTC", "ETH", "BNB", "SOL", "XRP",
+        "ADA", "AVAX", "DOT", "LINK", "UNI",
+        "DOGE", "TRX", "LTC",
     ],
 }
 
