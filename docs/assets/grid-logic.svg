@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="510" viewBox="0 0 1000 510" role="img" aria-labelledby="title desc">
+<title id="title">DynaGrid：让买入距离适应市场</title><desc id="desc">固定网格等距排列，动态网格在波动或库存上升时扩大买入间距；每次买入独立配对止盈。图为机制示意，并非收益展示或同时挂单数量。</desc>
+<rect width="1000" height="510" rx="16" fill="#f5f8fc"/>
+<g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif">
+<text x="40" y="42" fill="#2366b5" font-size="12" letter-spacing="2">DYNAGRID / STRATEGY NOTES</text>
+<text x="40" y="83" fill="#172e43" font-size="29" font-weight="600">让买入距离适应市场</text>
+<text x="40" y="111" fill="#64798d" font-size="15">波动与库存控制接货距离，止盈目标独立计算。</text>
+<rect x="40" y="140" width="448" height="220" rx="8" fill="white" stroke="#dae3ed"/>
+<rect x="512" y="140" width="448" height="220" rx="8" fill="white" stroke="#dae3ed"/>
+<text x="62" y="171" fill="#172e43" font-size="17" font-weight="600">固定间距</text>
+<text x="534" y="171" fill="#172e43" font-size="17" font-weight="600">动态间距</text>
+<text x="62" y="193" fill="#64798d" font-size="12">价格变化，预设间距保持不变</text>
+<text x="534" y="193" fill="#64798d" font-size="12">低波动较密 · 波动或库存升高时变疏</text>
+<g stroke="#c3d0dd" stroke-width="1.5">
+<path d="M62 225H466 M62 247H466 M62 269H466 M62 291H466 M62 313H466"/>
+</g>
+<g stroke="#2366b5" stroke-width="1.5" opacity=".6">
+<path d="M534 225H690 M534 238H690 M534 251H690 M534 264H690 M534 277H690 M766 225H938 M766 263H938 M766 309H938"/>
+</g>
+<g fill="none" stroke="#172e43" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round">
+<path d="M62 242L92 238L117 249L145 237L173 244L201 233L227 248L253 237L279 270L308 248L335 298L364 272L398 316L430 282L466 305"/>
+<path d="M534 242L564 238L589 249L617 237L645 244L673 233L699 248L725 237L751 270L780 248L807 298L836 272L870 316L902 282L938 305"/>
+</g>
+<path d="M707 280H743 M737 275L743 280L737 285" stroke="#2366b5" fill="none" stroke-width="1.5"/>
+<text x="62" y="343" fill="#64798d" font-size="11">网格线表示价格距离</text>
+<text x="534" y="343" fill="#64798d" font-size="11">每币最多一笔活动买单，并非同时铺满图中各档</text>
+<path d="M40 385H960" stroke="#dae3ed"/>
+<circle cx="58" cy="423" r="6" fill="#2366b5"/><text x="76" y="429" fill="#172e43" font-size="16">买入成交</text>
+<path d="M177 423H235 M229 418L235 423L229 428" stroke="#91a4b7" fill="none"/>
+<text x="256" y="429" fill="#172e43" font-size="16">手续费底线 + 常态波动补偿</text>
+<path d="M493 423H550 M544 418L550 423L544 428" stroke="#91a4b7" fill="none"/>
+<circle cx="580" cy="423" r="6" fill="#bc602c"/><text x="598" y="429" fill="#172e43" font-size="16">独立止盈卖单</text>
+<text x="40" y="481" fill="#64798d" font-size="12">机制示意 · 非真实行情或收益展示</text>
+<text x="960" y="481" text-anchor="end" fill="#64798d" font-size="12">Paper trading &amp; event replay</text>
+</g></svg>

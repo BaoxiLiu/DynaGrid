@@ -1,14 +1,21 @@
-# 密钥
-.env
-
-# 运行时产物 (状态、日志、交易记录、锁文件等)
-data/
-
-# Python
-__pycache__/
-*.pyc
-.pytest_cache/
-.DS_Store
-
-# macOS 资源叉文件
-._*
+# 只发布明确列出的源文件；运行数据、密钥和个人配置默认排除。
+/*
+!/.gitignore
+!/README.md
+!/AGENTS.md
+!/requirements.txt
+!/paper_grid/
+!/tests/
+/paper_grid/*
+!/paper_grid/*.py
+!/paper_grid/dashboard.html
+/tests/*
+!/tests/test_hardening.py
+**/__pycache__/
+**/._*
+!/docs/
+/docs/*
+!/docs/paper_grid.md
+!/docs/assets/
+/docs/assets/*
+!/docs/assets/grid-logic.svg

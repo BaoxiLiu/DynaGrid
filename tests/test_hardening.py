@@ -1,595 +1,673 @@
 import json
-import os
 import tempfile
 import threading
-import time
 import unittest
-import csv
-from unittest.mock import patch
-
-import exchange as exchange_module
-import pnl as pnl_module
-import state as state_module
-from config import MONITOR_COINS
-from exchange import Exchange
-from pnl import PnLTracker
-from market_data import (
-    BinanceBookTickerStream, MarketDataCache, MarketQuote, WebSocketTriggerObserver,
-)
-from risk import RiskManager
-from state import StateCorruptionError, StateManager, TierReentryState
-from strategy import StrategyEngine
-from volatility import VolatilityProfile, calculate_volatility_profile
 
 
-class RequestTimeout(Exception):
-    pass
+class PaperGridTests(unittest.TestCase):
+    def engine(self, **overrides):
+        from dataclasses import replace
+        from paper_grid.config import Settings
+        from paper_grid.engine import Engine
+        cfg = replace(Settings(), warmup_seconds=0, **overrides)
+        engine = Engine(cfg, 1000)
+        for symbol, s in engine.signals.items():
+            engine.filters[symbol] = (0.01, 0.001, 5.0)
+            for i in range(30):
+                s.candle(900 + i, 100, 100.01, 99.99)
+            s.last_trade_at = 1000
+        return engine
 
+    def quote(self, engine, symbol="BTCUSDC", now=1000, mid=100):
+        engine.on_quote(symbol, mid - .01, mid + .01, now)
 
-class FakeApi:
-    def __init__(self):
-        self.markets = {
-            "SOL/USDT": {
-                "id": "SOLUSDT",
-                "limits": {"cost": {"min": 10}},
-                "precision": {"amount": 0.001, "price": 0.01},
-            }
-        }
-        self.create_buy_calls = 0
-        self.create_sell_calls = 0
-        self.recovered_order = None
-        self.lookup_error = None
+    def test_paper_fee_accounts_and_shared_budget(self):
+        e = self.engine()
+        for sym in e.signals:
+            self.quote(e, sym)
+        self.assertEqual(len(e.orders), 6)
+        self.assertEqual(e.accounts["bnb_discount"]["cash"], 1000)
+        self.assertEqual(e.accounts["usdc_zero"]["cash"], 1000)
+        self.assertGreater(e.signals["BTCUSDT"].spacing, e.signals["BTCUSDC"].spacing)
+        self.assertLessEqual(e.reserve("bnb_discount"), 76)
 
-    def market(self, symbol):
-        return self.markets[symbol]
+    def test_paper_quote_touch_never_fills(self):
+        e = self.engine()
+        self.quote(e)
+        self.quote(e, now=1000.3, mid=99.98)
+        self.assertEqual(e.accounts["usdc_zero"]["buys"], 0)
 
-    def fetch_ticker(self, symbol):
-        return {"last": 100.0}
+    def test_paper_trade_latency_direction_and_duplicate(self):
+        e = self.engine()
+        self.quote(e)
+        order = next(iter(e.orders.values()))
+        price = order["price"] - .02
+        e.on_trade("BTCUSDC", price, 10, True, 1, 1000.1, 1000.1)
+        self.assertFalse(e.lots)
+        e.on_trade("BTCUSDC", price, 10, False, 2, 1000.3, 1000.3)
+        self.assertFalse(e.lots)
+        e.on_trade("BTCUSDC", order["price"], 10, True, 3, 1000.4, 1000.4)
+        self.assertFalse(e.lots)
+        e.on_trade("BTCUSDC", price, 10, True, 4, 1000.5, 1000.5)
+        self.assertEqual(len(e.lots), 1)
+        cash = e.accounts["usdc_zero"]["cash"]
+        e.on_trade("BTCUSDC", price, 10, True, 4, 1000.5, 1000.6)
+        self.assertEqual(e.accounts["usdc_zero"]["cash"], cash)
 
-    def amount_to_precision(self, symbol, amount):
-        return f"{float(amount):.3f}"
+    def test_paper_partial_fill_during_cancel(self):
+        e = self.engine()
+        self.quote(e)
+        o = next(iter(e.orders.values()))
+        e.advance(1000.3)
+        e.cancel(o, 1000.3, "test")
+        e.on_trade("BTCUSDC", o["price"] - .02, 1, True, 1, 1000.4, 1000.4)
+        self.assertAlmostEqual(e.lots[o["id"]]["qty"], .1)
+        e.advance(1000.6)
+        self.assertNotIn(o["id"], e.orders)
+        self.assertEqual(e.accounts["usdc_zero"]["buys"], 1)
 
-    def price_to_precision(self, symbol, price):
-        return f"{float(price):.2f}"
+    def test_paper_roundtrip_accounting_with_bnb_fee(self):
+        e = self.engine()
+        self.quote(e, "BTCUSDT")
+        buy = next(iter(e.orders.values()))
+        e.on_trade("BTCUSDT", buy["price"] - .02, 10, True, 1, 1000.3, 1000.3)
+        sell = next(o for o in e.orders.values() if o["side"] == "sell")
+        e.on_trade("BTCUSDT", sell["price"] + .02, 10, False, 2, 1000.7, 1000.7)
+        a = e.accounts["bnb_discount"]
+        self.assertEqual(a["roundtrips"], 1)
+        self.assertFalse(e.lots)
+        self.assertGreater(a["fees"], 0)
+        self.assertGreater(a["realized"], 0)
+        self.assertAlmostEqual(a["cash"] - 1000, a["realized"])
 
-    def create_market_buy_order(self, symbol, qty, params):
-        self.create_buy_calls += 1
-        client_id = params["clientOrderId"]
-        self.recovered_order = {
-            "id": "buy-1", "clientOrderId": client_id, "side": "buy",
-            "status": "closed", "average": 100.0, "filled": float(qty),
-            "amount": float(qty), "remaining": 0, "cost": 15.0,
-        }
-        raise RequestTimeout("response lost")
+    def test_paper_holdings_anchor_and_no_duplicate_buy(self):
+        e = self.engine(buy_windows=((60, 100), (300, 200), (900, 300)))
+        self.quote(e)
+        buy = next(iter(e.orders.values()))
+        e.on_trade("BTCUSDC", buy["price"] - .02, 10, True, 1, 1000.3, 1000.3)
+        self.quote(e, now=1000.4, mid=100.02)
+        buys = [o for o in e.orders.values() if o["side"] == "buy"]
+        self.assertEqual(len(buys), 1)
+        self.assertLess(buys[0]["price"], buy["price"])
+        for i in range(10):
+            self.quote(e, now=1000.5 + i * .01, mid=100.02)
+        self.assertEqual(sum(o["side"] == "buy" for o in e.orders.values()), 1)
 
-    def fetch_order_by_client_id(self, client_id, symbol):
-        if self.lookup_error:
-            raise self.lookup_error
-        return self.recovered_order
+    def test_paper_event_driven_shock_does_not_wait_for_second(self):
+        e = self.engine()
+        self.quote(e, now=1000.1)
+        self.quote(e, now=1000.15, mid=99.7)
+        self.assertTrue(e.signals["BTCUSDC"].paused)
+        self.assertTrue(next(iter(e.orders.values()))["cancel_at"])
 
-    def create_market_sell_order(self, symbol, qty, params):
-        self.create_sell_calls += 1
-        return {
-            "id": "sell-1", "clientOrderId": params.get("clientOrderId", ""),
-            "side": "sell", "status": "closed", "average": 101.0,
-            "filled": float(qty), "amount": float(qty), "remaining": 0,
-        }
+    def test_paper_rolling_drawdown_obeys_time_order(self):
+        from paper_grid.engine import RollingRange
+        w = RollingRange(5)
+        w.push(1, 100)
+        self.assertAlmostEqual(w.push(2, 90)[2], .1)
+        self.assertAlmostEqual(w.push(3, 101)[2], .1)
+        self.assertEqual(w.push(8, 102)[2], 0)
 
+    def test_paper_budget_blocks_new_buys(self):
+        e = self.engine(max_inventory=4)
+        self.quote(e)
+        self.assertFalse(e.orders)
 
-class FakePnL:
-    def record_sell(self, *args, **kwargs):
-        return 0.1
+    def test_paper_restart_preserves_lots_cancels_orders(self):
+        e = self.engine()
+        self.quote(e)
+        o = next(iter(e.orders.values()))
+        e.on_trade("BTCUSDC", o["price"] - .02, 10, True, 1, 1000.3, 1000.3)
+        restored = self.engine()
+        restored.restore(json.loads(json.dumps(e.snapshot())), 1001)
+        self.assertEqual(e.accounts, restored.accounts)
+        self.assertEqual(e.lots, restored.lots)
+        self.assertFalse(restored.orders)
+        self.assertEqual(restored.signals["BTCUSDC"].first, 0)
 
+    def test_paper_trade_gap_suspends_fill_inference(self):
+        e = self.engine()
+        self.quote(e)
+        e.on_trade("BTCUSDC", 100, 1, True, 1, 1000.3, 1000.3)
+        e.on_trade("BTCUSDC", 99, 10, True, 3, 1000.4, 1000.4)
+        self.assertFalse(e.lots)
+        self.assertFalse(e.orders)
+        self.assertEqual(e.counters["trade_gaps"], 1)
 
-class FakeReconcileExchange:
-    def __init__(self, extra_order=False, balances=None):
-        self.extra_order = extra_order
-        self.balances = balances or {"SOL": 1.0, "USDT": 300.0}
+    def test_paper_hour_report_includes_unrealized(self):
+        from paper_grid.report import render
+        e = self.engine()
+        text = render(e.summary(1001), {}, 1000)
+        self.assertIn("累计浮盈亏", text)
+        self.assertIn("尚无完整回合", text)
 
-    def fetch_balance(self):
-        return self.balances
+    def test_paper_rolling_drawdown_matches_brute_force(self):
+        import random
+        from paper_grid.engine import RollingRange
+        rng = random.Random(17)
+        w = RollingRange(5)
+        prices = []
+        for i in range(300):
+            now, price = i * .11, rng.uniform(90, 110)
+            prices.append((now, price))
+            prices = [(t, p) for t, p in prices if t >= now - 5]
+            actual = w.push(now, price)
+            peak, dd = 0, 0
+            for _, p in prices:
+                peak = max(peak, p)
+                dd = max(dd, 1 - p / peak)
+            self.assertAlmostEqual(actual[0], max(p for _, p in prices))
+            self.assertAlmostEqual(actual[1], min(p for _, p in prices))
+            self.assertAlmostEqual(actual[2], dd)
 
-    def fetch_open_orders(self):
-        orders = [{
-            "coin": "SOL", "order_id": "sell-local", "side": "sell",
-            "status": "open", "amount": 1.0, "filled": 0.0,
-        }]
-        if self.extra_order:
-            orders.append({
-                "coin": "SOL", "order_id": "orphan", "side": "sell",
-                "status": "open", "amount": 0.2, "filled": 0.0,
-            })
-        return orders
+    def test_paper_configuration_change_cannot_reuse_account(self):
+        e = self.engine()
+        altered = self.engine(lot=30)
+        with self.assertRaises(ValueError):
+            altered.restore(e.snapshot(), 1001)
 
-    def fetch_tickers(self, coins):
-        return {coin: {"price": 100.0} for coin in coins}
+    def test_paper_report_files_and_restart_are_durable(self):
+        from pathlib import Path
+        from paper_grid.run import Runner
+        from paper_grid.config import Settings
+        with tempfile.TemporaryDirectory() as tmp:
+            runner = Runner(Path(tmp), Settings())
+            now = runner.engine.started + 3601
+            runner.report(now, runner.engine.summary(now))
+            self.assertTrue((Path(tmp) / "latest_report.md").exists())
+            self.assertEqual(json.loads((Path(tmp) / "state.json").read_text())["report_at"], now)
+            runner.lock_file.close()
 
-    def get_min_notional(self, coin):
-        return 10.0
+    def test_paper_source_has_no_private_exchange_access(self):
+        import ast
+        from pathlib import Path
+        for path in (Path(__file__).resolve().parents[1] / "paper_grid").glob("*.py"):
+            if path.name.startswith("._"):
+                continue
+            tree = ast.parse(path.read_text())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    self.assertFalse(any(x.name in {"exchange", "ccxt", "dotenv"} for x in node.names))
+                if isinstance(node, ast.ImportFrom) and node.level == 0:
+                    self.assertNotIn(node.module, {"config", "state", "exchange", "dotenv"})
 
-    def fetch_order_status(self, order_id, coin):
-        return {
-            "coin": coin, "order_id": order_id, "side": "sell",
-            "status": "open", "amount": 1.0, "filled": 0.0,
-            "remaining": 1.0, "price": 101.0,
-        }
+    def test_paper_dashboard_only_exposes_readonly_routes(self):
+        from http.server import ThreadingHTTPServer
+        from pathlib import Path
+        from urllib.request import urlopen
+        from urllib.error import HTTPError
+        from paper_grid.dashboard import Dashboard, handler_for
+        with tempfile.TemporaryDirectory() as tmp:
+            dashboard = Dashboard(Path(tmp))
+            server = ThreadingHTTPServer(("127.0.0.1", 0), handler_for(dashboard))
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{server.server_port}"
+            try:
+                with urlopen(base + "/") as r:
+                    self.assertIn("网格观察台", r.read().decode())
+                with urlopen(base + "/api/overview") as r:
+                    self.assertEqual(json.load(r)["orders"], [])
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(base + "/state.json")
+                self.assertEqual(error.exception.code, 404)
+                error.exception.close()
+                with self.assertRaises(HTTPError) as error:
+                    urlopen(base + "/api/overview", data=b"{}")
+                self.assertEqual(error.exception.code, 501)
+                error.exception.close()
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
 
-    def fetch_order_by_client_id(self, coin, client_id):
-        return None
+    def test_paper_dashboard_events_include_fills_not_every_order(self):
+        from pathlib import Path
+        from paper_grid.dashboard import tail_events
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "events-2026-11-07.jsonl").write_text(
+                '\n'.join(json.dumps({"kind": k, "time": n}) for n, k in enumerate(["submit", "fill", "roundtrip"])))
+            self.assertEqual([x["kind"] for x in tail_events(root)], ["roundtrip", "fill"])
 
+    def test_paper_late_buy_fills_extend_sell_coverage(self):
+        e = self.engine()
+        self.quote(e)
+        buy = next(iter(e.orders.values()))
+        e.on_trade("BTCUSDC", buy["price"] - .02, 1, True, 1, 1000.3, 1000.3)
+        e.cancel(buy, 1000.31, "test")
+        e.on_trade("BTCUSDC", buy["price"] - .02, 1, True, 2, 1000.4, 1000.4)
+        sells = [o for o in e.orders.values() if o["side"] == "sell"]
+        self.assertAlmostEqual(sum(o["remaining"] for o in sells), .2)
+        self.assertAlmostEqual(e.lots[buy["id"]]["qty"], .2)
 
-class HardeningTests(unittest.TestCase):
-    def state_paths(self, directory):
-        return patch.multiple(
-            state_module,
-            STATE_FILE=os.path.join(directory, "state.json"),
-            STATE_BACKUP_FILE=os.path.join(directory, "state.json.bak"),
-            STATE_LOCK_FILE=os.path.join(directory, "state.lock"),
-        )
+    def test_paper_small_topup_waits_for_cancel_and_accounts_inflight_sell(self):
+        e = self.engine()
+        self.quote(e)
+        buy = next(iter(e.orders.values()))
+        e.on_trade("BTCUSDC", buy["price"] - .02, 1, True, 1, 1000.3, 1000.3)
+        sell = next(o for o in e.orders.values() if o["side"] == "sell")
+        e.on_trade("BTCUSDC", buy["price"] - .02, .1, True, 2, 1000.6, 1000.6)
+        self.assertTrue(sell["cancel_at"])
+        e.on_trade("BTCUSDC", sell["price"] + .02, .2, False, 3, 1000.7, 1000.7)
+        e.ensure_sells("BTCUSDC", 1000.71)
+        self.assertEqual(sum(o["side"] == "sell" for o in e.orders.values()), 1)
+        e.advance(1000.9)
+        e.ensure_sells("BTCUSDC", 1000.9)
+        self.assertAlmostEqual(sum(o["remaining"] for o in e.orders.values() if o["side"] == "sell"), .09)
+        self.assertAlmostEqual(e.lots[buy["id"]]["qty"], .09)
 
-    def test_exchange_rate_limit_circuit_parses_ban_expiry_and_429_fallback(self):
-        exchange = Exchange(api=FakeApi())
-        now = 1_700_000_000.0
-        banned_until_ms = int((now + 95) * 1000)
-        exchange._failure(
-            "binance 418 I'm a teapot "
-            f'{{"code":-1003,"msg":"IP banned until {banned_until_ms}"}}'
-        )
-        self.assertEqual(exchange.rate_limit_cooldown_seconds(now), 95)
+    def test_paper_partial_buy_keeps_its_remaining_budget(self):
+        e = self.engine()
+        self.quote(e)
+        buy = next(iter(e.orders.values()))
+        e.on_trade("BTCUSDC", buy["price"] - .02, .1, True, 1, 1000.3, 1000.3)
+        self.quote(e, now=1003)
+        self.assertFalse(buy["cancel_at"])
+        self.assertEqual([o["id"] for o in e.orders.values() if o["side"] == "buy"], [buy["id"]])
+        self.quote(e, now=1003.1, mid=99.7)
+        self.assertTrue(buy["cancel_at"])  # 部分成交仍必须服从冲击保护
 
-        fallback = Exchange(api=FakeApi())
-        with patch("exchange.time.time", return_value=now):
-            fallback._failure('binance 429 Too Many Requests {"code":-1003}')
-        self.assertGreaterEqual(fallback.rate_limit_cooldown_seconds(now), 60)
+    def test_paper_quote_silence_does_not_restart_warmup(self):
+        e = self.engine()
+        self.quote(e)
+        s = e.signals["BTCUSDC"]
+        first = s.first
+        e.advance(1000.3)
+        e.tick(1006)
+        self.assertTrue(next(iter(e.orders.values()))["cancel_at"])
+        self.quote(e, now=1007)
+        self.assertIs(e.signals["BTCUSDC"], s)
+        self.assertEqual(s.first, first)
+        self.assertEqual(s.reason, "ready")
+        self.assertEqual(e.counters["disconnects"], 0)
+        e.disconnect(1008)
+        self.assertEqual(e.signals["BTCUSDC"].first, 0)
 
-    def test_new_t1_candidates_follow_market_cap_order_not_config_order(self):
-        manager = StateManager()
-        engine = StrategyEngine(FakeReconcileExchange(), manager, FakePnL())
-        test_coins = ["BTC", "ETH", "DOGE", "TRX", "SOL"]
-        ranked = ["DOGE", "TRX", "SOL", "ETH", "BTC"]
-        with patch("strategy.MONITOR_COINS", test_coins):
-            tickers = {coin: {"price": 100.0} for coin in test_coins}
-            with patch("strategy.MarketCapRanker.get_ranked", return_value=ranked):
-                candidates = engine._collect_buy_candidates(tickers, 400)
+    def test_paper_quote_resume_still_detects_drop(self):
+        e = self.engine()
+        self.quote(e)
+        self.quote(e, now=1006, mid=99.3)
+        self.assertGreater(e.signals["BTCUSDC"].metrics["a60"], .006)
 
-        tier1_coins = [
-            candidate["coin"] for candidate in candidates
-            if candidate["tier_index"] == 0 and candidate["is_new"]
-        ]
-        # 按市值顺序: DOGE 第一，TRX 第二，SOL 第三
-        self.assertEqual(tier1_coins[:3], ["DOGE", "TRX", "SOL"])
+    def test_paper_dust_merge_preserves_cost_target_and_budget(self):
+        e = self.engine()
+        self.quote(e)
+        e.orders.clear()
+        for lid, price in [("a", 100), ("b", 101)]:
+            e.lots[lid] = dict(account="usdc_zero", symbol="BTCUSDC", qty=.03,
+                               cost=.03 * price, buy_price=price, target=price + 1,
+                               spacing=.01, opened=999)
+        before = e.inventory("usdc_zero")
+        e.ensure_sells("BTCUSDC", 1001)
+        self.assertEqual(len(e.lots), 1)
+        self.assertAlmostEqual(e.inventory("usdc_zero"), before)
+        sell = next(iter(e.orders.values()))
+        self.assertAlmostEqual(sell["qty"], .06)
+        self.assertGreaterEqual(sell["price"], 102)
+        self.assertEqual(e.lots["a"]["source_lots"], ["a", "b"])
+        e.ensure_sells("BTCUSDC", 1001.1)
+        self.assertEqual(len(e.orders), 1)
 
-    def test_state_is_atomic_backward_compatible_and_counts_only_holding(self):
-        with tempfile.TemporaryDirectory() as directory, self.state_paths(directory):
-            state_path = os.path.join(directory, "state.json")
-            old_state = {
-                "coins": {
-                    "SOL": {
-                        "base_price": 100,
-                        "active": True,
-                        "tiers": [
-                            {"tier_index": 0, "amount_usdt": 15,
-                             "buy_price": 100, "sell_price": 101, "qty": 0.15,
-                             "sell_order_id": "a", "status": "holding"},
-                            {"tier_index": 1, "amount_usdt": 15,
-                             "buy_price": 96, "sell_price": 97, "qty": 0.15,
-                             "sell_order_id": "b", "status": "sold"},
-                        ],
-                    }
-                },
-                "cooling": {"ADA": 1.0},
-            }
-            with open(state_path, "w", encoding="utf-8") as f:
-                json.dump(old_state, f)
+    def test_paper_quantize_float_tail_does_not_drop_a_step(self):
+        from paper_grid.engine import quantize
+        self.assertEqual(quantize(.00031999999999999997, .00001), .00032)
+        self.assertEqual(quantize(.00031999, .00001), .00031)
 
-            manager = StateManager()
-            self.assertTrue(manager.load())
-            self.assertEqual(manager.get_total_committed_all(), 15)
-            self.assertTrue(manager.check_cooling("ADA", 0))
-            manager.save()
+    def test_paper_dust_does_not_merge_live_buy_lot(self):
+        e = self.engine()
+        self.quote(e)
+        buy = next(iter(e.orders.values()))
+        e.on_trade("BTCUSDC", buy["price"] - .02, .3, True, 1, 1000.3, 1000.3)
+        e.lots["other"] = dict(e.lots[buy["id"]])
+        e.ensure_sells("BTCUSDC", 1000.4)
+        self.assertEqual(len(e.lots), 2)
+        self.assertFalse(any(o["side"] == "sell" for o in e.orders.values()))
 
-            with open(state_path, "r", encoding="utf-8") as f:
-                saved = json.load(f)
-            self.assertEqual(saved["schema_version"], 3)
-            self.assertTrue(os.path.exists(os.path.join(directory, "state.json.bak")))
+    def test_paper_multi_sell_roundtrip_reconciles_cash(self):
+        e = self.engine()
+        self.quote(e, "BTCUSDT")
+        buy = next(iter(e.orders.values()))
+        e.on_trade("BTCUSDT", buy["price"] - .02, 1, True, 1, 1000.3, 1000.3)
+        e.on_trade("BTCUSDT", buy["price"] - .02, 10, True, 2, 1000.4, 1000.4)
+        self.assertGreaterEqual(sum(o["side"] == "sell" for o in e.orders.values()), 2)
+        sell_price = max(o["price"] for o in e.orders.values())
+        e.on_trade("BTCUSDT", sell_price + .02, 10, False, 3, 1001, 1001)
+        self.assertFalse(e.lots)
+        self.assertFalse(e.orders)
+        a = e.accounts["bnb_discount"]
+        self.assertEqual(a["roundtrips"], 1)
+        self.assertAlmostEqual(a["cash"] - 1000, a["realized"])
 
-    def test_retire_dust_tier_removes_strategy_holding_and_starts_cooling(self):
-        manager = StateManager()
-        manager.add_coin("SOL", 100)
-        manager.add_tier("SOL", 0, 15, 100, 101, 0.0001, "")
-        manager.block_coin("SOL", "below minimum order size")
+    def test_paper_reprice_budget_survives_cancel_fill_and_restart(self):
+        e = self.engine()
+        self.quote(e)
+        buy = next(iter(e.orders.values()))
+        e.on_trade("BTCUSDC", buy["price"] - .02, .5, True, 1, 1000.3, 1000.3)
+        e.cancel(buy, 1000.31, "shock")
+        e.on_trade("BTCUSDC", buy["price"] - .02, .2, True, 2, 1000.4, 1000.4)
+        spent = .07 * buy["price"]
+        restored = self.engine()
+        restored.restore(json.loads(json.dumps(e.snapshot(), allow_nan=False)), 1000.5)
+        self.quote(restored, now=1001)
+        new = next(o for o in restored.orders.values() if o["side"] == "buy")
+        self.assertLessEqual(new["price"] * new["remaining"] + spent, 25 + 1e-9)
+        self.assertAlmostEqual(restored.budget.entries["BTCUSDC"]["remaining"], 25 - spent)
+        self.assertAlmostEqual(restored.budget.allowance("BTCUSDC", 1001), 25 - spent)
 
-        self.assertTrue(manager.retire_dust_tier("SOL", 0, 101))
-        self.assertNotIn("SOL", manager.coins)
-        self.assertTrue(manager.is_cooling("SOL"))
-        self.assertFalse(manager.is_blocked("SOL"))
+    def test_paper_rolling_windows_reserve_expiry_and_sell_no_refund(self):
+        from paper_grid.policy import BuyBudget
+        from paper_grid.config import Settings
+        b = BuyBudget(Settings())
+        for t in [1000, 1061]:
+            b.start("SOLUSDC")
+            b.record("SOLUSDC", str(t), 25, t)
+            b.entries.pop("SOLUSDC")
+        self.assertEqual(b.allowance("SOLUSDC", 1122), 0)  # 五分钟上限
+        self.assertEqual(b.allowance("SOLUSDC", 1301, 10), 15)
+        for t in [1301, 1362]:
+            b.start("SOLUSDC")
+            b.record("SOLUSDC", str(t), 25, t)
+            b.entries.pop("SOLUSDC")
+        self.assertEqual(b.allowance("SOLUSDC", 1663), 0)  # 十五分钟上限
+        self.assertEqual(b.allowance("SOLUSDC", 1901), 25)
+        self.assertEqual(b.allowance("ETHUSDC", 1663), 25)
 
-    def test_holdings_summary_shows_next_unfilled_tier_trigger(self):
-        manager = StateManager()
-        manager.add_coin("SOL", 100)
-        manager.add_tier("SOL", 0, 15, 100, 101, 0.15, "sell-local")
-        engine = StrategyEngine(FakeReconcileExchange(), manager, FakePnL())
+    def test_paper_actual_sell_does_not_release_buy_limit(self):
+        e = self.engine()
+        self.quote(e)
+        buy = next(iter(e.orders.values()))
+        e.on_trade("BTCUSDC", buy["price"] - .02, 10, True, 1, 1000.3, 1000.3)
+        sell = next(o for o in e.orders.values() if o["side"] == "sell")
+        e.on_trade("BTCUSDC", sell["price"] + .02, 10, False, 2, 1000.7, 1000.7)
+        self.quote(e, now=1001)
+        self.assertFalse(any(o["side"] == "buy" for o in e.orders.values()))
+        self.assertEqual(e.signals["BTCUSDC"].reason, "buy_rate_limit")
 
-        summary = engine.get_holdings_summary({"SOL": {"price": 98}}, 100)
-        target = summary[0]["next_buy"]
-        self.assertEqual(target["tier"], "T2")
-        self.assertEqual(target["amount"], 20)
-        self.assertEqual(target["trigger_price"], 96.0)
-        self.assertEqual(target["status"], "等待触发")
+    def test_paper_shock_replay_limits_inflight_and_recovers_small(self):
+        e = self.engine()
+        self.quote(e)
+        buy = next(iter(e.orders.values()))
+        e.advance(1000.3)
+        self.quote(e, now=1000.4, mid=99.7)
+        self.assertTrue(buy["cancel_at"])
+        e.on_trade("BTCUSDC", 99.6, 1, True, 1, 1000.5, 1000.5)
+        self.assertLessEqual(e.inventory("usdc_zero"), 25)
+        e.advance(1000.7)
+        for t in range(1001, 1036):
+            self.quote(e, now=t, mid=99.7)
+            self.assertFalse(any(o["side"] == "buy" for o in e.orders.values()))
+        self.quote(e, now=1036, mid=99.7)
+        buy2 = next(o for o in e.orders.values() if o["side"] == "buy")
+        self.assertLessEqual(buy2["price"] * buy2["qty"], 12.5)
+        self.assertLessEqual(e.inventory("usdc_zero") + e.reserve("usdc_zero"), 25)
+        covered = sum(o["remaining"] for o in e.orders.values() if o["side"] == "sell")
+        self.assertAlmostEqual(covered, sum(l["qty"] for l in e.lots.values()))
 
-    def test_holdings_summary_hides_unexecutable_next_tier(self):
-        manager = StateManager()
-        manager.add_coin("SOL", 100)
-        manager.add_tier("SOL", 0, 15, 100, 101, 0.15, "sell-local")
-        manager.block_coin("SOL", "manual review")
-        engine = StrategyEngine(FakeReconcileExchange(), manager, FakePnL())
+    def test_paper_v_rebound_cannot_resume_immediately(self):
+        e = self.engine()
+        self.quote(e)
+        self.quote(e, now=1000.1, mid=99.7)
+        self.quote(e, now=1000.2, mid=100)
+        e.advance(1001)
+        self.assertTrue(e.signals["BTCUSDC"].paused)
+        self.assertFalse(any(o["side"] == "buy" for o in e.orders.values()))
 
-        summary = engine.get_holdings_summary({"SOL": {"price": 98}}, 100)
-        self.assertIsNone(summary[0]["next_buy"])
+    def test_paper_gap_rebound_and_restart_keep_safety_pause(self):
+        e = self.engine()
+        self.quote(e)
+        self.quote(e, now=1006, mid=99.5)
+        self.assertTrue(e.signals["BTCUSDC"].paused)
+        e.disconnect(1007)
+        self.assertTrue(e.signals["BTCUSDC"].paused)
+        restored = self.engine()
+        restored.restore(json.loads(json.dumps(e.snapshot(), allow_nan=False)), 1008)
+        self.quote(restored, now=1009, mid=100)
+        self.assertTrue(restored.signals["BTCUSDC"].paused)
+        self.assertFalse(any(o["side"] == "buy" for o in restored.orders.values()))
 
-    def test_websocket_observer_emits_once_then_rearms(self):
-        cache = MarketDataCache()
-        observer = WebSocketTriggerObserver(cache, stale_seconds=5, rearm_rate=0.001)
-        observer.set_levels([{
-            "coin": "SOL", "tier": "T2", "tier_index": 1,
-            "trigger_price": 96.0, "source": "static_tier",
-        }])
+    def test_paper_staircase_decline_and_stale_trade_replay(self):
+        e = self.engine(trend_seconds=10, trend_drop=.003, shock_floor=.1)
+        for i in range(12):
+            self.quote(e, now=1000+i, mid=100-i*.04)
+        self.assertTrue(e.signals["BTCUSDC"].paused)
+        self.assertEqual(e.signals["BTCUSDC"].reason, "downtrend")
+        e.on_trade("BTCUSDC", 90, 100, True, 1, 990, 1011.1)
+        self.assertFalse(e.lots)  # 延迟成交不能用于填单
 
-        now = 1_700_000_000.0
-        with patch("market_data.time.time", return_value=now):
-            observer.on_quote(MarketQuote("SOL", 95.9, 95.95, now))
-            first = observer.drain_events()
-            observer.on_quote(MarketQuote("SOL", 95.8, 95.9, now))
-            second = observer.drain_events()
-            observer.on_quote(MarketQuote("SOL", 96.2, 96.2, now))
-            observer.on_quote(MarketQuote("SOL", 95.8, 95.9, now))
-            third = observer.drain_events()
+    def test_paper_budget_history_bounded_and_snapshot_json(self):
+        from paper_grid.policy import BuyBudget
+        from paper_grid.config import Settings
+        b = BuyBudget(Settings())
+        b.start("SOLUSDC")
+        for t in range(2000):
+            b.record("SOLUSDC", "1", .0001, t)
+        self.assertLessEqual(len(b.history["SOLUSDC"]), 901)
+        clone = BuyBudget(Settings())
+        clone.restore(json.loads(json.dumps(b.snapshot())))
+        self.assertEqual(clone.allowance("SOLUSDC", 2000), b.allowance("SOLUSDC", 2000))
 
-        self.assertEqual(len(first), 1)
-        self.assertEqual(second, [])
-        self.assertEqual(len(third), 1)
-        self.assertIn("仅观察，不下单", first[0])
+    def test_paper_budget_config_rejects_invalid_windows(self):
+        from paper_grid.config import Settings
+        for kwargs in [dict(buy_windows=()), dict(buy_windows=((300, 50), (60, 25))),
+                       dict(buy_windows=((60, 0),)), dict(recovery_fraction=0)]:
+            with self.assertRaises(ValueError):
+                Settings(**kwargs)
 
-    def test_websocket_trigger_only_wakes_rest_with_debounce(self):
-        cache = MarketDataCache()
-        wake_event = threading.Event()
-        observer = WebSocketTriggerObserver(
-            cache, stale_seconds=5, rearm_rate=0.001,
-            rest_wakeup_event=wake_event, wake_debounce_seconds=2,
-        )
-        observer.set_levels([{
-            "coin": "SOL", "tier": "T2", "tier_index": 1,
-            "trigger_price": 96.0, "source": "static_tier",
-        }])
+    def test_paper_replay_all_windows_and_accounting_invariants(self):
+        e = self.engine(shock_floor=1, trend_drop=1)
+        symbol = "BTCUSDC"
+        trade_id = 0
+        for i in range(1000):
+            now = 1000 + i * 2
+            mid = 100 - i * .001
+            e.signals[symbol].candle(now, mid, mid+.001, mid-.001)
+            self.quote(e, now=now, mid=mid)
+            trade_id += 1
+            e.on_trade(symbol, mid-1, .4, True, trade_id, now+.3, now+.3)
+            trade_id += 1
+            e.on_trade(symbol, mid+2, .2, False, trade_id, now+.6, now+.6)
+            reserved = e.reserve("usdc_zero")
+            rows = e.budget.prune(symbol, now+.6)
+            for seconds, limit in e.cfg.buy_windows:
+                used = sum(v for t, v in rows if t+1 > now+.6-seconds)
+                self.assertLessEqual(used + reserved, limit + 1e-8)
+            self.assertAlmostEqual(e.accounts["usdc_zero"]["cash"] + e.inventory("usdc_zero"),
+                                   1000 + e.accounts["usdc_zero"]["realized"], places=7)
+            for lid, lot in e.lots.items():
+                covered = sum(o["remaining"] for o in e.orders.values() if o["side"] == "sell" and o["lot_id"] == lid)
+                self.assertLessEqual(covered, lot["qty"] + 1e-10)
+        self.assertGreater(e.accounts["usdc_zero"]["buys"], 10)
 
-        with patch("market_data.time.time", return_value=100.0):
-            observer.on_quote(MarketQuote("SOL", 95.9, 95.9, 100.0))
-            self.assertTrue(wake_event.is_set())
-            wake_event.clear()
-            observer.on_quote(MarketQuote("SOL", 96.2, 96.2, 100.0))
-            observer.on_quote(MarketQuote("SOL", 95.9, 95.9, 100.0))
-            self.assertFalse(wake_event.is_set())
+    def test_paper_dust_does_not_pin_reentry_but_keeps_cost(self):
+        e = self.engine()
+        sym = "SOLUSDC"
+        e.lots["dust"] = dict(account="usdc_zero", symbol=sym, qty=.011,
+                              cost=.97812, buy_price=88.92, target=88.96,
+                              spacing=.00034, opened=999)
+        e.accounts["usdc_zero"]["cash"] -= .97812
+        self.quote(e, sym, mid=89.15)
+        buy = next(o for o in e.orders.values() if o["side"] == "buy")
+        self.assertGreater(buy["price"], 89.10)
+        self.assertAlmostEqual(e.inventory("usdc_zero"), .97812)
+        status = e.summary(1000)
+        self.assertEqual(status["symbols"][sym]["dust_lots"], 1)
+        self.assertAlmostEqual(status["accounts"]["usdc_zero"]["equity"],
+                               1000-.97812+.011*89.14)
+        # 尘埃仍占用库存上限，不能靠分类绕过资金约束。
+        limited = self.engine(max_coin_inventory=1)
+        limited.lots["dust"] = dict(e.lots["dust"])
+        self.quote(limited, sym, mid=89.15)
+        self.assertFalse(limited.orders)
 
-        with patch("market_data.time.time", return_value=103.0):
-            observer.on_quote(MarketQuote("SOL", 96.2, 96.2, 103.0))
-            observer.on_quote(MarketQuote("SOL", 95.9, 95.9, 103.0))
-            self.assertTrue(wake_event.is_set())
+    def test_paper_sellable_lot_still_anchors_reentry(self):
+        e = self.engine()
+        sym = "SOLUSDC"
+        e.lots["holding"] = dict(account="usdc_zero", symbol=sym, qty=.1,
+                                 cost=8.892, buy_price=88.92, target=88.96,
+                                 spacing=.00034, opened=999)
+        self.quote(e, sym, mid=89.15)
+        buy = next(o for o in e.orders.values() if o["side"] == "buy")
+        self.assertLess(buy["price"], 88.92)
+        self.assertFalse(e.is_dust(e.lots["holding"]))
 
-    def test_websocket_drops_out_of_order_quote_and_reconnect_wakes_rest(self):
-        cache = MarketDataCache()
-        now = time.time()
-        self.assertTrue(cache.update("SOL", 100, 101, updated_at=now, sequence=20))
-        self.assertFalse(cache.update("SOL", 90, 91, updated_at=now + 1, sequence=19))
-        self.assertEqual(cache.get("SOL", max_age=10).ask, 101)
+    def test_paper_coin_inventory_scales_spacing_not_size(self):
+        from paper_grid.policy import inventory_policy
+        from paper_grid.config import Settings
+        cfg = Settings()
+        self.assertEqual(inventory_policy(cfg, 0), (1, 25))
+        self.assertEqual(inventory_policy(cfg, 125), (1.75, 25))
+        self.assertEqual(inventory_policy(cfg, 250), (4, 25))
+        e = self.engine()
+        sym = "ETHUSDC"
+        e.lots["held"] = dict(account="usdc_zero", symbol=sym, qty=1.25, cost=125,
+                              buy_price=100, target=101, spacing=.01, opened=999)
+        self.quote(e, sym)
+        order = next(o for o in e.orders.values() if o["side"] == "buy")
+        self.assertGreater(order["price"] * order["qty"], 24.8)
+        self.assertEqual(e.budget.entries[sym]["remaining"], 25)
+        self.assertGreater(e.coin_policy(sym)[0], 1.75)  # 待成交预留也计入
+        self.assertEqual(e.coin_policy("SOLUSDC"), (1, 25))
+        self.assertEqual(e.lots["held"]["target"], 101)
 
-        wake_event = threading.Event()
-        observer = WebSocketTriggerObserver(cache, stale_seconds=5, rearm_rate=0.001)
-        stream = BinanceBookTickerStream(
-            ["SOL"], cache, observer, on_reconnect=wake_event.set,
-        )
-        stream._handle_open(None)  # 首次连接不需要额外 REST 扫描
-        self.assertFalse(wake_event.is_set())
-        stream._handle_open(None)  # 重连必须尽快恢复 REST 复核
-        self.assertTrue(wake_event.is_set())
+    def test_paper_full_entry_waits_for_capacity_and_rolling_allowance(self):
+        e = self.engine(max_coin_inventory=20)
+        self.quote(e)
+        self.assertFalse(e.orders)
+        e = self.engine()
+        e.budget.start("BTCUSDC")
+        e.budget.record("BTCUSDC", "past", 10, 999)
+        e.budget.entries.clear()
+        self.quote(e)
+        self.assertFalse(e.orders)
+        self.assertEqual(e.signals["BTCUSDC"].reason, "buy_rate_limit")
+        e.signals["BTCUSDC"].candle(1060, 100, 100.01, 99.99)
+        self.quote(e, now=1061)
+        buy = next(o for o in e.orders.values() if o["side"] == "buy")
+        self.assertGreater(buy["qty"] * buy["price"], 24.8)
 
-    def test_websocket_levels_use_saved_dynamic_price_without_state_mutation(self):
-        manager = StateManager()
-        manager.add_coin("SOL", 100)
-        manager.add_tier("SOL", 0, 15, 100, 101, 0.15, "sell-t1")
-        manager.add_tier("SOL", 1, 20, 96, 97.44, 0.2, "sell-t2")
-        manager.mark_tier_sold("SOL", 1)
-        manager.set_tier_reentry("SOL", TierReentryState(
-            tier_index=1, next_trigger_price=94.0, policy_version=2,
-        ))
-        engine = StrategyEngine(FakeReconcileExchange(), manager, FakePnL())
+    def test_paper_entry_remainder_below_minimum_after_precision_finishes(self):
+        e = self.engine()
+        sym = "BTCUSDC"
+        e.filters[sym] = (.01, .00001, 5)
+        e.budget.start(sym)
+        e.budget.record(sym, "prior", 19.7154464, 900)
+        e.signals[sym].bid, e.signals[sym].ask, e.signals[sym].at = 75700, 75701, 1000
+        before = dict(e.accounts["usdc_zero"])
+        e.place_buy(sym, 75700, 1000)
+        self.assertNotIn(sym, e.budget.entries)
+        self.assertFalse(e.orders)
+        self.assertEqual(e.accounts["usdc_zero"], before)
+        self.assertEqual(e.events[-1]["kind"], "entry_complete")
+        e.place_buy(sym, 75700, 1001)
+        self.assertEqual(len(e.orders), 1)
+        self.assertEqual(e.budget.entries[sym]["remaining"], 25)
 
-        before = [(t.tier_index, t.status) for t in manager.coins["SOL"].tiers]
-        levels = engine.get_websocket_observation_levels()
-        after = [(t.tier_index, t.status) for t in manager.coins["SOL"].tiers]
+    def test_paper_independent_tp_inventory_and_partial_fill(self):
+        import copy
+        e = self.engine()
+        sym = "BTCUSDC"
+        self.quote(e, sym)
+        o = next(iter(e.orders.values()))
+        tp = o["tp_spacing"]
+        e.budget.start(sym)
+        e.fill(o, .05, 1001)
+        target = e.lots[o["lot_id"]]["target"]
+        e.signals[sym].candles.clear()
+        e.signals[sym].candles.extend([.1] * 30)
+        e.fill(o, .05, 1002)
+        self.assertEqual(e.lots[o["lot_id"]]["target"], target)
+        clone = self.engine()
+        clone.restore(copy.deepcopy(e.snapshot()), 1003)
+        self.assertEqual(clone.lots[o["lot_id"]]["target"], target)
+        self.assertEqual(e.snapshot()["orders"][o["id"]]["tp_spacing"], tp)
+        self.assertEqual(clone.budget.snapshot(), e.budget.snapshot())
+        e2 = self.engine()
+        e2.lots["held"] = dict(account="usdc_zero",symbol=sym,qty=1,cost=100,buy_price=100,target=101,spacing=.01,opened=900)
+        self.quote(e2, sym)
+        o2 = next(o for o in e2.orders.values() if o["side"] == "buy")
+        self.assertGreater(o2["spacing"], o["spacing"])
+        self.assertEqual(o2["tp_spacing"], tp)
+        self.assertEqual(e2.lots["held"]["target"], 101)
 
-        dynamic = [level for level in levels if level["tier"] == "T2"]
-        self.assertEqual(dynamic[0]["trigger_price"], 94.0)
-        self.assertEqual(dynamic[0]["source"], "dynamic_reentry")
-        self.assertEqual(before, after)
+    def test_paper_tp_fee_floor_and_compensation_cap(self):
+        from paper_grid.policy import take_profit_spacing
+        from paper_grid.config import Settings
+        cfg = Settings()
+        for fee in (0, .00075):
+            floor, _ = take_profit_spacing(cfg, fee, [])
+            tp, _ = take_profit_spacing(cfg, fee, [.2]*30)
+            self.assertAlmostEqual(tp-floor, cfg.tp_extra_cap)
+            self.assertGreaterEqual((1+tp)*(1-fee)/(1+fee), 1+cfg.min_profit)
 
-    def test_corrupt_primary_recovers_backup_but_both_corrupt_raise(self):
-        with tempfile.TemporaryDirectory() as directory, self.state_paths(directory):
-            primary = os.path.join(directory, "state.json")
-            backup = os.path.join(directory, "state.json.bak")
-            with open(primary, "w", encoding="utf-8") as f:
-                f.write("{")
-            with open(backup, "w", encoding="utf-8") as f:
-                json.dump({"coins": {}, "cooling": {}}, f)
-            self.assertTrue(StateManager().load())
-
-            with open(backup, "w", encoding="utf-8") as f:
-                f.write("{")
-            with self.assertRaises(StateCorruptionError):
-                StateManager().load()
-
-    def test_timeout_recovers_by_client_id_without_duplicate_buy(self):
-        api = FakeApi()
-        ex = Exchange(api=api)
-        ex._symbol_map = {"SOL": "SOL/USDT"}
-        with patch.object(exchange_module.time, "sleep", return_value=None):
-            result = ex.market_buy("SOL", 15, client_order_id="asg-test-buy")
-        self.assertEqual(api.create_buy_calls, 1)
-        self.assertEqual(result["order_id"], "buy-1")
-        self.assertEqual(ex.last_order_outcome, "confirmed")
-
-    def test_unknown_timeout_never_blindly_retries(self):
-        api = FakeApi()
-        api.lookup_error = RuntimeError("query unavailable")
-        ex = Exchange(api=api)
-        ex._symbol_map = {"SOL": "SOL/USDT"}
-        with patch.object(exchange_module.time, "sleep", return_value=None):
-            result = ex.market_buy("SOL", 15, client_order_id="asg-test-buy")
-        self.assertIsNone(result)
-        self.assertEqual(api.create_buy_calls, 1)
-        self.assertEqual(ex.last_order_outcome, "unknown")
-
-    def test_market_sell_handles_precision_string(self):
-        api = FakeApi()
-        ex = Exchange(api=api)
-        ex._symbol_map = {"SOL": "SOL/USDT"}
-        result = ex.market_sell("SOL", 0.203, client_order_id="asg-test-sell")
-        self.assertEqual(result["qty"], 0.203)
-        self.assertEqual(api.create_sell_calls, 1)
-
-    def test_limit_sell_precision_rejection_is_not_an_exception(self):
-        api = FakeApi()
-        api.amount_to_precision = lambda symbol, amount: (_ for _ in ()).throw(
-            RuntimeError("amount below exchange precision")
-        )
-        ex = Exchange(api=api)
-        ex._symbol_map = {"SOL": "SOL/USDT"}
-        self.assertIsNone(ex.limit_sell("SOL", 0.0001, 100))
-        self.assertEqual(ex.last_order_outcome, "rejected")
-
-    def test_risk_checks_post_trade_cash_and_active_commitment(self):
-        manager = StateManager()
-        risk = RiskManager(manager)
-        self.assertFalse(risk.can_buy("SOL", 15, 34, False).allowed)
-        self.assertTrue(risk.can_buy("SOL", 15, 100, False).allowed)
-
-    def test_pnl_schema_migrates_and_sell_order_is_idempotent(self):
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, "trades.csv")
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow([
-                    "timestamp", "coin", "tier", "side", "price", "qty",
-                    "usdt_value", "fee", "pnl", "total_pnl",
-                ])
-                writer.writerow([
-                    "2026-01-01T00:00:00+08:00", "SOL", "T1", "BUY",
-                    100, 0.15, 15, 0.015, 0, 0,
-                ])
-            with patch.object(pnl_module, "TRADE_LOG_FILE", path):
-                tracker = PnLTracker()
-                first = tracker.record_sell(
-                    "SOL", 0, 100, 101, 0.15, 0.015, 0.01515,
-                    order_id="sell-1",
-                )
-                second = tracker.record_sell(
-                    "SOL", 0, 100, 101, 0.15, 0.015, 0.01515,
-                    order_id="sell-1",
-                )
-            self.assertEqual(first, second)
-            with open(path, "r", encoding="utf-8") as f:
-                rows = list(csv.DictReader(f))
-            self.assertEqual(len(rows), 2)
-            self.assertIn("order_id", rows[0])
-
-    def test_startup_reconcile_rejects_orphan_open_order(self):
-        with tempfile.TemporaryDirectory() as directory, self.state_paths(directory), patch(
-            "strategy.RECONCILE_REPORT_FILE", os.path.join(directory, "report.json")
-        ):
-            manager = StateManager()
-            manager.add_coin("SOL", 100)
-            manager.add_tier("SOL", 0, 15, 100, 101, 1.0, "sell-local")
-
-            ok_engine = StrategyEngine(FakeReconcileExchange(), manager, FakePnL())
-            self.assertTrue(ok_engine.reconcile_startup()["ok"])
-
-            bad_engine = StrategyEngine(
-                FakeReconcileExchange(extra_order=True), manager, FakePnL(),
-            )
-            report = bad_engine.reconcile_startup()
-            self.assertFalse(report["ok"])
-            self.assertTrue(manager.is_blocked("SOL"))
-
-    def test_startup_reconcile_allows_configured_bnb_fee_balance(self):
-        with tempfile.TemporaryDirectory() as directory, self.state_paths(directory), patch(
-            "strategy.RECONCILE_REPORT_FILE", os.path.join(directory, "report.json")
-        ), patch("strategy.NON_STRATEGY_BALANCE_ALLOWANCES", {"BNB": 0.25}):
-            manager = StateManager()
-            manager.add_coin("SOL", 100)
-            manager.add_tier("SOL", 0, 15, 100, 101, 1.0, "sell-local")
-            exchange = FakeReconcileExchange(
-                balances={"SOL": 1.0, "BNB": 0.18, "USDT": 300.0},
-            )
-
-            report = StrategyEngine(exchange, manager, FakePnL()).reconcile_startup()
-
-            self.assertTrue(report["ok"])
-            self.assertTrue(any("BNB" in warning for warning in report["warnings"]))
-
-    def test_atr_profile_uses_closed_candles_and_historical_median(self):
-        hour = 3_600_000
+    def test_replay_uses_same_engine_and_rejects_backwards_time(self):
+        from paper_grid.replay import replay
+        from paper_grid.engine import Engine
+        e = self.engine()
+        filters = e.filters
         rows = []
-        for index in range(7):
-            rows.append([
-                index * hour, 100.0, 101.0, 99.0, 100.0, 1.0,
-            ])
-        # This open candle has an extreme range and must not affect the result.
-        rows.append([7 * hour, 100.0, 150.0, 50.0, 100.0, 1.0])
+        for i in range(31):
+            now = 1800000000+i*60
+            for sym in e.signals:
+                rows.append({"received": now, "packet": {"e":"kline","s":sym,"k":{"x":True,"T":now*1000-1,"o":"100","h":"100.01","l":"99.99"}}})
+                rows.append({"received": now, "packet":{"s":sym,"b":"99.99","a":"100.01","u":i+1}})
+        result = replay(rows, filters)
+        direct = Engine()
+        direct.filters = filters
+        direct.started = rows[0]["received"]
+        last = None
+        for r in rows:
+            now = r["received"]
+            if last is not None and now-last>5:
+                direct.tick(last+5.001)
+                direct.tick(last+5.252)
+            direct.tick(now)
+            direct.on_packet(r["packet"], now)
+            last=now
+        self.assertEqual(result["status"]["accounts"], direct.summary(last)["accounts"])
+        with self.assertRaises(ValueError):
+            replay(list(reversed(rows)), filters)
+        with self.assertRaises(ValueError):
+            replay([], filters)
 
-        profile = calculate_volatility_profile(
-            rows, timeframe="1h", period=2, baseline_bars=4,
-            now_ms=7 * hour + hour // 2,
-        )
+    def test_stale_valuation_does_not_update_peak_or_drawdown(self):
+        e = self.engine()
+        e.lots["old"] = dict(account="usdc_zero", symbol="BTCUSDC", qty=1,
+                             cost=100, buy_price=100, target=101, spacing=.01, opened=900)
+        a = e.accounts["usdc_zero"]
+        a.update(cash=950, peak_equity=1000, max_drawdown=.02)
+        summary = e.summary(1000)
+        self.assertFalse(summary["accounts"]["usdc_zero"]["valuation_valid"])
+        self.assertEqual(a["peak_equity"], 1000)
+        self.assertEqual(a["max_drawdown"], .02)
+        e.signals["BTCUSDC"].bid = 40
+        e.signals["BTCUSDC"].at = 1000
+        self.assertTrue(e.summary(1000)["accounts"]["usdc_zero"]["valuation_valid"])
+        self.assertEqual(a["peak_equity"], 1000)
 
-        self.assertIsNotNone(profile)
-        self.assertAlmostEqual(profile.atr, 2.0)
-        self.assertAlmostEqual(profile.natr, 0.02)
-        self.assertAlmostEqual(profile.median_natr, 0.02)
-        self.assertAlmostEqual(profile.raw_ratio, 1.0)
+    def test_replay_timer_never_runs_ahead_of_market(self):
+        from unittest.mock import patch
+        from paper_grid.replay import replay
+        from paper_grid.engine import Engine
+        ticks = []
+        original = Engine.tick
+        def record(engine, now):
+            ticks.append(now)
+            return original(engine, now)
+        rows = [{"received":t,"packet":{"s":"BTCUSDC","b":"99","a":"101","u":i+1}}
+                for i,t in enumerate([1000,1005.1,1005.2])]
+        with patch.object(Engine, "tick", record):
+            replay(rows, self.engine().filters)
+        self.assertEqual(ticks, sorted(ticks))
+        self.assertLessEqual(max(ticks),1005.2)
 
-    def test_dynamic_tier_reentry_enforces_minimum_pullback_and_atr_can_widen_it(self):
-        manager = StateManager()
-        manager.add_coin("SOL", 100)
-        manager.add_tier("SOL", 1, 15, 100, 101.5, 0.15, "sell-t2")
-        tier = manager.coins["SOL"].tiers[-1]
-        tier.status = "sold"
-        engine = StrategyEngine(FakeReconcileExchange(), manager, FakePnL())
-
-        def profile(ratio):
-            return VolatilityProfile(
-                atr=1.0, natr=0.01 * ratio, median_natr=0.01,
-                raw_ratio=ratio, latest_candle_timestamp=1,
-                baseline_samples=720,
-            )
-
-        with patch.object(engine, "_get_volatility_profile", return_value=profile(1.0)):
-            normal = engine._configure_dynamic_reentry("SOL", tier, 101.5)
-        with patch.object(engine, "_get_volatility_profile", return_value=profile(0.5)):
-            low = engine._configure_dynamic_reentry("SOL", tier, 101.5)
-        with patch.object(engine, "_get_volatility_profile", return_value=profile(2.0)):
-            high = engine._configure_dynamic_reentry("SOL", tier, 101.5)
-
-        # T2 的最低回调为 2%，所以 ATR 即使较低或在上限也不能让回补变浅。
-        self.assertAlmostEqual(normal.next_trigger_price, 101.5 * 0.98)
-        self.assertAlmostEqual(low.next_trigger_price, 101.5 * 0.98)
-        self.assertAlmostEqual(high.next_trigger_price, 101.5 * 0.98)
-        self.assertAlmostEqual(normal.applied_gap_rate, 0.02)
-        self.assertAlmostEqual(low.effective_vol_ratio, 1.0)
-        self.assertAlmostEqual(high.effective_vol_ratio, 1.3)
-
-        manager.add_tier("SOL", 3, 40, 70, 77, 0.5, "sell-t4")
-        tier4 = manager.coins["SOL"].tiers[-1]
-        tier4.status = "sold"
-        with patch.object(engine, "_get_volatility_profile", return_value=profile(1.0)):
-            normal_t4 = engine._configure_dynamic_reentry("SOL", tier4, 77)
-        with patch.object(engine, "_get_volatility_profile", return_value=profile(2.0)):
-            high_t4 = engine._configure_dynamic_reentry("SOL", tier4, 77)
-        # T4 常态下执行最低 10% 回调；高波动时 ATR 建议 11.818%，进一步拉深。
-        self.assertAlmostEqual(normal_t4.next_trigger_price, 77 * 0.90)
-        self.assertAlmostEqual(normal_t4.applied_gap_rate, 0.10)
-        self.assertAlmostEqual(high_t4.next_trigger_price, 67.9)
-        self.assertAlmostEqual(high_t4.applied_gap_rate, (1 - 1 / 1.10) * 1.3)
-
-    def test_missing_atr_disables_reentry_instead_of_using_static_level(self):
-        manager = StateManager()
-        manager.add_coin("SOL", 100)
-        manager.add_tier("SOL", 0, 15, 100, 101, 0.15, "sell-t1")
-        manager.add_tier("SOL", 1, 15, 96, 97.44, 0.15, "sell-t2")
-        manager.coins["SOL"].tiers[-1].status = "sold"
-        engine = StrategyEngine(FakeReconcileExchange(), manager, FakePnL())
-
-        with patch.object(engine, "_get_volatility_profile", return_value=None), patch(
-            "strategy.MarketCapRanker.get_ranked", return_value=["SOL"]
-        ):
-            candidates = engine._collect_buy_candidates(
-                {"SOL": {"price": 95}}, 300,
-            )
-
-        self.assertFalse(any(c["tier_index"] == 1 for c in candidates))
-        reentry = manager.get_tier_reentry("SOL", 1)
-        self.assertEqual(reentry.status, "unavailable")
-
-    def test_old_reentry_policy_is_recalculated(self):
-        manager = StateManager()
-        manager.add_coin("SOL", 100)
-        manager.add_tier("SOL", 1, 15, 100, 101.5, 0.15, "sell-t2")
-        tier = manager.coins["SOL"].tiers[-1]
-        tier.status = "sold"
-        manager.set_tier_reentry("SOL", TierReentryState(
-            tier_index=1, next_trigger_price=100.0, status="ready",
-        ))
-        engine = StrategyEngine(FakeReconcileExchange(), manager, FakePnL())
-        profile = VolatilityProfile(
-            atr=1.0, natr=0.01, median_natr=0.01, raw_ratio=1.0,
-            latest_candle_timestamp=1, baseline_samples=720,
-        )
-
-        with patch.object(engine, "_get_volatility_profile", return_value=profile):
-            trigger = engine._dynamic_reentry_trigger("SOL", tier)
-
-        self.assertAlmostEqual(trigger, 101.5 * 0.98)
-        self.assertGreater(manager.get_tier_reentry("SOL", 1).policy_version, 0)
-
-    def test_reentry_is_created_only_after_tier_is_fully_sold(self):
-        manager = StateManager()
-        manager.add_coin("SOL", 100)
-        manager.add_tier("SOL", 1, 15, 100, 101.5, 1.0, "sell-t2")
-        tier = manager.coins["SOL"].tiers[-1]
-        tier.buy_fee_usdt = 0.01
-        engine = StrategyEngine(FakeReconcileExchange(), manager, FakePnL())
-        profile = VolatilityProfile(
-            atr=1.0, natr=0.01, median_natr=0.01, raw_ratio=1.0,
-            latest_candle_timestamp=1, baseline_samples=720,
-        )
-        summary = {"actions": [], "errors": []}
-
-        engine._apply_sell_fill("SOL", tier, {
-            "filled": 0.4, "price": 101.5, "fee": 0.001,
-            "fee_currency": "USDT", "order_id": "partial",
-        }, summary)
-        self.assertEqual(tier.status, "holding")
-        self.assertIsNone(manager.get_tier_reentry("SOL", 1))
-
-        with patch.object(engine, "_get_volatility_profile", return_value=profile):
-            engine._apply_sell_fill("SOL", tier, {
-                "filled": 0.6, "price": 101.5, "fee": 0.001,
-                "fee_currency": "USDT", "order_id": "final",
-            }, summary)
-        self.assertEqual(tier.status, "sold")
-        self.assertAlmostEqual(
-            manager.get_tier_reentry("SOL", 1).next_trigger_price,
-            101.5 * 0.98,
-        )
-
-    def test_t4_neutral_gap_and_reentry_state_survive_restart(self):
-        with tempfile.TemporaryDirectory() as directory, self.state_paths(directory):
-            manager = StateManager()
-            manager.add_coin("BTC", 100)
-            manager.set_tier_reentry("BTC", TierReentryState(
-                tier_index=3,
-                next_trigger_price=100,
-                last_buy_price=100,
-                anchor_sell_price=110,
-                neutral_gap_rate=1 - (1 / 1.10),
-                applied_gap_rate=1 - (1 / 1.10),
-            ))
-            manager.save()
-
-            restored = StateManager()
-            self.assertTrue(restored.load())
-            reentry = restored.get_tier_reentry("BTC", 3)
-            self.assertIsNotNone(reentry)
-            self.assertAlmostEqual(reentry.next_trigger_price, 100)
-            self.assertAlmostEqual(reentry.neutral_gap_rate, 1 - (1 / 1.10))
+    def test_sharpe_excludes_invalid_valuation(self):
+        from pathlib import Path
+        from paper_grid.dashboard import performance
+        with tempfile.TemporaryDirectory() as tmp:
+            rows=[{"time":3600*i,"capital":1000,"accounts":{"a":{"equity":1000+i,"valuation_valid":i!=3}}} for i in range(1,9)]
+            result=performance(Path(tmp),rows,{"settings":{"capital":1000},"accounts":{"a":{}}},28801)
+            self.assertEqual(result["a"]["sharpe_samples"],5)
 
 
 if __name__ == "__main__":
